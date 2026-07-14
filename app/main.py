@@ -161,3 +161,114 @@ async def convert(file: UploadFile = File(...)):
             "X-Unique-Tokens": str(len(set(found))),
         },
     )
+
+
+@app.post("/extract_text")
+async def extract_text(file: UploadFile = File(...)):
+    """
+    Return the template's full paragraph text, numbered, with style names.
+
+    This is what the TOKENIZER (Claude) reads. It needs the whole document, not just
+    existing tokens, because most carrier templates carry their fillable spots as PROSE:
+
+        "Dwelling is a (one story, raised ranch, two story, etc.) wood framed house"
+        "Roof has a (25 year 3-tab, 30 year laminate, etc.) roof with a */12 pitch"
+        "(Put N/A if this is the original inspection and delete this paragraph.)"
+        "Inspection of the right elevation revealed no visible storm related damage."
+
+    None of those have tokens. All of them are fillable. A regex cannot tell the last one
+    (deliverable default prose -> keep it) from the others (needs replacing). Claude can.
+    """
+    import io, zipfile
+    from lxml import etree
+    from .docx_fill import W
+
+    data = await file.read()
+    src = zipfile.ZipFile(io.BytesIO(data))
+    out = []
+    for partname, kind in [("word/document.xml", "body"),
+                           ("word/header1.xml", "header"),
+                           ("word/header2.xml", "header"),
+                           ("word/footer1.xml", "footer")]:
+        try:
+            root = etree.fromstring(src.read(partname))
+        except KeyError:
+            continue
+        for i, p in enumerate(root.iter(f"{W}p")):
+            text = "".join(t.text or "" for t in p.iter(f"{W}t"))
+            if not text.strip():
+                continue
+            style = ""
+            pstyle = p.find(f"{W}pPr/{W}pStyle")
+            if pstyle is not None:
+                style = pstyle.get(f"{W}val", "")
+            out.append({"i": len(out), "part": kind, "style": style, "text": text})
+    src.close()
+    return {"paragraphs": out, "count": len(out)}
+
+
+@app.post("/tokenize")
+async def tokenize(
+    file: UploadFile = File(...),
+    edits: str = Form(...),   # [{"i":11,"new_text":"Dwelling is a [DWELLING_STORIES] ..."}]
+):
+    """
+    Write Claude's tokenized text back into the .docx, IN PLACE.
+
+    `edits` is a list of {"i": <paragraph index from /extract_text>, "new_text": "..."}.
+    Only listed paragraphs change. Everything else -- headers, footers, styles, numbering,
+    page setup -- is untouched, because we edit the XML tree rather than rebuilding.
+
+    The result is a template with real tokens where there used to be prose, ready for /fill.
+    """
+    import io, json as _json, zipfile
+    from lxml import etree
+    from .docx_fill import W, XML_SPACE
+
+    data = await file.read()
+    try:
+        edit_list = _json.loads(edits)
+        by_index = {int(e["i"]): e["new_text"] for e in edit_list}
+    except Exception as e:
+        raise HTTPException(400, f"bad edits JSON: {e}")
+
+    src = zipfile.ZipFile(io.BytesIO(data))
+    buf = io.BytesIO()
+    applied = 0
+    counter = 0
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out:
+        for item in src.infolist():
+            blob = src.read(item.filename)
+            if item.filename in ("word/document.xml", "word/header1.xml",
+                                 "word/header2.xml", "word/footer1.xml"):
+                root = etree.fromstring(blob)
+                for p in root.iter(f"{W}p"):
+                    ts = list(p.iter(f"{W}t"))
+                    text = "".join(t.text or "" for t in ts)
+                    if not text.strip():
+                        continue
+                    idx = counter
+                    counter += 1
+                    if idx not in by_index or not ts:
+                        continue
+                    ts[0].text = by_index[idx]
+                    ts[0].set(XML_SPACE, "preserve")
+                    for t in ts[1:]:
+                        t.text = ""
+                    applied += 1
+                blob = etree.tostring(root, xml_declaration=True,
+                                      encoding="UTF-8", standalone=True)
+            out.writestr(item, blob)
+    src.close()
+
+    return Response(
+        content=buf.getvalue(),
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".wordprocessingml.document"),
+        headers={
+            "Content-Disposition": 'attachment; filename="tokenized.docx"',
+            "X-Edits-Applied": str(applied),
+            "X-Edits-Requested": str(len(by_index)),
+        },
+    )
